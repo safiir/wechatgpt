@@ -17,9 +17,9 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-func Makesure[T any](logic func() (T, error)) (T, error) {
+func Once[T any](fn func() (T, error)) (T, error) {
 	for {
-		t, err := logic()
+		t, err := fn()
 		if err != nil {
 			time.Sleep(time.Millisecond * 100)
 			continue
@@ -28,23 +28,39 @@ func Makesure[T any](logic func() (T, error)) (T, error) {
 	}
 }
 
+func Retry[T any](n int, fn func() (T, error)) (T, error) {
+	var t T
+	var err error
+	for i := 0; i < n; i++ {
+		t, err = fn()
+		if err != nil {
+			time.Sleep(time.Millisecond * 100)
+			continue
+		}
+		return t, nil
+	}
+	return t, err
+}
+
 func HandleMsgText(client *openai.Client, msg *openwechat.Message) {
 	content := strings.TrimSpace(msg.Content)
 	if len(content) == 0 {
 		return
 	}
-	resp, err := client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model: openai.GPT3Dot5Turbo,
-			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: content,
+	resp, err := Retry(3, func() (response openai.ChatCompletionResponse, err error) {
+		return client.CreateChatCompletion(
+			context.Background(),
+			openai.ChatCompletionRequest{
+				Model: openai.GPT3Dot5Turbo,
+				Messages: []openai.ChatCompletionMessage{
+					{
+						Role:    openai.ChatMessageRoleUser,
+						Content: content,
+					},
 				},
 			},
-		},
-	)
+		)
+	})
 	if err != nil {
 		fmt.Printf("ChatCompletion error: %v\n", err)
 		msg.ReplyText("oops, something went wrong")
@@ -52,45 +68,79 @@ func HandleMsgText(client *openai.Client, msg *openwechat.Message) {
 	}
 	reply := strings.TrimSpace(resp.Choices[0].Message.Content)
 
-	Makesure(func() (*openwechat.SentMessage, error) {
+	Once(func() (*openwechat.SentMessage, error) {
 		return msg.ReplyText(reply)
 	})
 }
 
 func Reply(msg *openwechat.Message, client *openai.Client, db *leveldb.DB) {
-	sender, _ := msg.Sender()
-	if sender.IsSelf() {
+	if msg.MsgType == 51 {
 		return
 	}
+
+	sender, err := msg.Sender()
+	if err != nil {
+		fmt.Printf("err: %v\n", err)
+		return
+	}
+
+	receiver, err := msg.Receiver()
+	if err != nil {
+		fmt.Printf("err: %v\n", err)
+		return
+	}
+
+	// fmt.Printf("%v\n", []string{sender.NickName, receiver.NickName})
+
+	if sender.IsSelf() && !receiver.IsSelf() {
+		return
+	}
+
 	from := sender.UserName
 	flag := fmt.Sprintf("%s_freeze", from)
-	_, err := db.Get([]byte(flag), nil)
+
+	switch strings.ToLower(strings.TrimSpace(msg.Content)) {
+	case "begin", "start", "resume", "continue", "继续":
+		err = db.Delete([]byte(flag), nil)
+		if err != nil {
+			return
+		}
+		Once(func() (*openwechat.SentMessage, error) {
+			return msg.ReplyText("received, type stop to terminate")
+		})
+	case "end", "stop", "break", "暂停", "停止", "停", "停停", "停停停", "停停停停":
+		err = db.Put([]byte(flag), []byte("true"), nil)
+		if err != nil {
+			return
+		}
+		Once(func() (*openwechat.SentMessage, error) {
+			return msg.ReplyText("received, type start to resume")
+		})
+	default:
+	}
+
+	_, err = db.Get([]byte(flag), nil)
 	if err == nil {
 		return
 	}
 	switch msg.MsgType {
 	case openwechat.MsgTypeText:
-		switch msg.Content {
-		case "start":
-			err = db.Delete([]byte(flag), nil)
-			if err != nil {
-				return
-			}
-			Makesure(func() (*openwechat.SentMessage, error) {
-				return msg.ReplyText("received")
-			})
-		case "end":
-			err = db.Put([]byte(flag), []byte("true"), nil)
-			if err != nil {
-				return
-			}
-			Makesure(func() (*openwechat.SentMessage, error) {
-				return msg.ReplyText("received")
-			})
-		default:
-			HandleMsgText(client, msg)
-		}
+		HandleMsgText(client, msg)
 	case openwechat.MsgTypeImage:
+		// Once(func() (*openwechat.SentMessage, error) {
+		// 	file, err := os.Open("pic.jpeg")
+		// 	if err != nil {
+		// 		return nil, err
+		// 	}
+		// 	return msg.ReplyImage(file)
+		// })
+		// Once(func() (*openwechat.SentMessage, error) {
+		// 	file, err := os.Open("pic.jpeg")
+		// 	if err != nil {
+		// 		return nil, err
+		// 	}
+		// 	return msg.ReplyFile(file)
+		// })
 	case openwechat.MsgTypeVoice:
 	case openwechat.MsgTypeVerify:
 	case openwechat.MsgTypePossibleFriend:
@@ -191,6 +241,6 @@ func main() {
 	})
 	fmt.Printf("%v\n", groupNames)
 
-	// 阻塞主goroutine, 直到发生异常或者用户主动退出
+	// 阻塞住 goroutine, 直到发生异常或者用户主动退出
 	bot.Block()
 }
