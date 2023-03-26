@@ -1,0 +1,4 @@
+breakpoint set -n sqlite3_key
+continue
+memory read -s 1 -f x -c 32 --outfile .memory.hexdump $rsi
+quit
